@@ -112,6 +112,14 @@ def grade(source, level):
                 f"`import nki`, `import nki.language as nl`, and `import nki.isa as nisa`. "
                 f"Use exactly those three.")
     except Exception as e:
+        if level == 4 and isinstance(e, NameError) and "nki" in str(e):
+            return (sum(WEIGHTS[k] for k, v in parts.items() if v), parts,
+                "The replacement file is missing the required NKI imports. A complete "
+                "file must begin with these exact lines, before @nki.jit:\n"
+                "import nki\n"
+                "import nki.language as nl\n"
+                "import nki.isa as nisa\n"
+                "Then define the decorated kernel. Return the imports and function together.")
         return (sum(WEIGHTS[k] for k, v in parts.items() if v), parts,
                 f"The file imports but {spec['entry']} could not be loaded: "
                 f"{type(e).__name__}: {e}")
@@ -138,12 +146,15 @@ def grade(source, level):
         # numbers happen to match on CPU: the kernel would be wrong on the device.
         hazards = [w for w in counted.get("warnings", [])
                    if "incorrect results on hardware" in w]
+        if m and level == 2:
+            m = transpose_result_hint(m)
         if hazards and not m:
             m = ("CORRECT ON CPU BUT WRONG ON HARDWARE: " + hazards[0]
                  + ". Fix that before anything else -- the simulator agrees with the reference here "
                    "and the device would not.")
         if m:
-            failures.append((nkibench.label(case, level), m))
+            failures.append((nkibench.label(case, level),
+                             enrich(m, level=level) if level == 4 else m))
             continue
         passed += 1
         if level >= 3 and counted["bytes"] and {"M", "K", "N"} <= set(case):
@@ -358,12 +369,41 @@ def enrich(error_text, level=None):
                   r"indexing result of shape \((\d+),?\)", error_text)
     if m:
         val, dst = int(m.group(1)), int(m.group(2))
+        if level == 4:
+            return (error_text + f" The copied value has {val} elements but the destination "
+                    f"has {dst}. Check the PSUM-to-SBUF tensor_copy: its result needs "
+                    "a separate SBUF tile with the SAME shape as the PSUM tile, "
+                    "(tile_m, tile_n). An input tile has shape (tile_k, tile_m) or "
+                    "(tile_k, tile_n); do not reuse it for this result. Store the "
+                    "result SBUF into the matching M and N output slice after the K loop.")
+        if level == 2:
+            return (error_text + " A partition row holds F1*F2 elements; copying it into "
+                    "a 128-row tile does not broadcast it. Keep both transpose SBUF "
+                    "tiles shaped (rows, F1*F2), with rows=min(128, P-start). "
+                    "Copy input_tile[:, nl.ds(i*F2+j, 1)] to "
+                    "output_tile[:, nl.ds(j*F1+i, 1)] using nisa.tensor_copy. "
+                    "Both views have shape (rows, 1). Then DMA the output tile "
+                    "to out[start:start+rows, :]. PSUM is unnecessary here.")
         return (error_text + f" You assigned {val} elements into a slice that holds {dst}. Assignment "
                 f"does not reshape or broadcast either: the slice on the left and the value on the "
                 f"right must have the SAME shape. If the value is bigger, you are writing a whole tile "
                 f"where a slice belongs -- index the destination to match, e.g. "
                 f"out[i*128:(i+1)*128, :] = tile. If it is smaller, you are looping over the wrong "
                 f"dimension.")
+    if level == 2:
+        scalar_bound = re.search(
+            r"Out-of-bound access for tensor .*? on dimension (\d+): "
+            r"index (\d+) exceed dimension size of (\d+)", error_text)
+        if scalar_bound:
+            dim, index, size = scalar_bound.groups()
+            return (error_text + f" Index {index} is outside dimension {dim}, whose "
+                    f"valid indices are 0 through {int(size)-1}. Swapping indices "
+                    "in tile[i,j] = tile[j,i] does not transpose a rectangular "
+                    "tile safely and also overwrites source values. Keep P as "
+                    "the partition axis and use separate (rows, F1*F2) input "
+                    "and output SBUF tiles. For i in range F1 and j in range F2, "
+                    "tensor_copy input[:, nl.ds(i*F2+j, 1)] into "
+                    "output[:, nl.ds(j*F1+i, 1)]. Store every output row via DMA.")
     m = re.search(r"Out-of-bound access for tensor .*? on dimension (\d+): "
                   r"index range \[(\d+), (\d+)\] exceed dimension size of (\d+)",
                   error_text)
@@ -384,6 +424,12 @@ def enrich(error_text, level=None):
                 f"nisa.tensor_copy. Do not allocate a new psum tile per chunk and do not write partial "
                 f"results to HBM.")
     m = re.search(r"(\w+) (?:dst|src)? ?must be in \['sbuf', 'psum'\], got shared_hbm", error_text)
+    if m and level == 2:
+        return (error_text + f" `nisa.{m.group(1)}` needs on-chip tiles, but the tile you passed "
+                f"was allocated with buffer=nl.shared_hbm. Change the INPUT and OUTPUT WORK tiles "
+                f"to buffer=nl.sbuf: nl.ndarray((rows, F), dtype=x.dtype, buffer=nl.sbuf). Keep "
+                f"shared_hbm only for the single `out` tensor you return. Do not replace "
+                f"tensor_copy with dma_copy for the element moves.")
     if m:
         return (error_text + f" `nisa.{m.group(1)}` only moves data between on-chip buffers, sbuf and "
                 f"psum. To reach HBM -- the tensor you allocated with buffer=nl.shared_hbm and will "
@@ -400,6 +446,12 @@ def enrich(error_text, level=None):
         return (error_text + " Pass every argument by keyword, e.g. "
                 "nisa.nc_matmul(dst=..., stationary=..., moving=...), so none is bound twice.")
     if "must have at least 2 dimensions" in error_text:
+        if level == 3:
+            return (error_text + " The matmul result has TWO dimensions: "
+                    "(lhsT.shape[1], rhs.shape[1]), or (M, N). lhsT.shape[1:] is only "
+                    "(M,). Correct the output allocation AND any PSUM/SBUF allocation "
+                    "derived from output.shape. Use a separate (M, N) result SBUF tile "
+                    "for the PSUM-to-SBUF copy; keep the input tiles (K, M) and (K, N).")
         return (error_text + " Every SBUF and PSUM tile needs two dimensions: a partition dimension "
                 "first, then a free dimension. A 1-D tile is not allowed, so write "
                 "nl.ndarray((rows, cols), ...) and give a length-N vector the shape (1, N) or "
@@ -421,6 +473,12 @@ def enrich(error_text, level=None):
         return error_text + available_names(f"{m.group(1)}.{m.group(2)}")
     m = re.search(r"'(\w+)' object has no attribute '(\w+)'", error_text)
     if m:
+        if level == 2 and m.groups() == ("int", "dtype"):
+            return (error_text + " Shape dimensions and offsets are Python integers. "
+                    "For a shape bound use Python min(128, P-start), not nl.min: "
+                    "nl.min reduces a tensor and tries to read its dtype. Allocate "
+                    "both SBUF tiles as (rows, F), load x[start:start+rows, :], and "
+                    "take the element dtype from x.dtype, not from a shape integer.")
         return (error_text + f" A {m.group(1)} is not a numpy array, so it has no "
                 f"`{m.group(2)}`. Use the nl/nisa functions instead.")
     return error_text
@@ -739,7 +797,18 @@ def solve(a, level, log, rep=0):
             return best[0], rnd + 1
         tried.append(top[2])
         repeats = streak
-        if repeats >= 2 and (best[1] or "").strip():
+        if level == 4 and not scaffolded and (latest[0] or "").strip():
+            # Level 4's first useful failure often names a tile-dimension mistake. Do not
+            # spend another full model round repeating prose guidance: put the explicit
+            # M/N/K loop structure into the very first repair prompt.
+            scaffolded = True
+            ledger = "\n".join(f"- {t[:160]}" for t in dict.fromkeys(tried))
+            prompt = (repair_prompt(level, latest[0], latest[1], scaffold=True)
+                      + f"\n\nThis candidate failed; repair it using the scaffold.\n{ledger}")
+            print("  level 4 escalation: adding the 3D tile-loop scaffold to the first repair")
+            continue
+        repeated_level4_failure = level == 4 and seen[top[2]] >= 2
+        if (repeats >= 2 or repeated_level4_failure) and (best[1] or "").strip():
             # Sampling on this endpoint is greedy, so an unchanged prompt returns an unchanged
             # answer. Measured: the same TypeError 19 rounds running. Changing the prompt is the
             # only thing that can change the answer, so say what has already been tried.
