@@ -23,6 +23,7 @@ Every attempt is appended to a JSONL file with its reward, so the log is the del
 """
 
 import argparse
+import ast
 import json
 import os
 import re
@@ -136,7 +137,8 @@ def grade(source, level):
                     f"CANNOT SIMULATE: {e}")
         except Exception as e:
             failures.append((nkibench.label(case, level),
-                             enrich(f"raised {type(e).__name__}: {e}", level)))
+                             enrich(f"raised {type(e).__name__}: {e}", level=level,
+                                    shape=case)))
             continue
         parts["runs"] = True
         m = (nkibench.check_inputs_untouched(before, args)
@@ -148,13 +150,47 @@ def grade(source, level):
                    if "incorrect results on hardware" in w]
         if m and level == 2:
             m = transpose_result_hint(m)
+        if m and level in (5, 6, 7):
+            m = hoist_result_hint(m)
         if hazards and not m:
             m = ("CORRECT ON CPU BUT WRONG ON HARDWARE: " + hazards[0]
                  + ". Fix that before anything else -- the simulator agrees with the reference here "
                    "and the device would not.")
         if m:
-            failures.append((nkibench.label(case, level),
-                             enrich(m, level=level) if level == 4 else m))
+            failure = enrich(m, level=level, shape=case) if level == 4 else m
+            if (level == 4 and "NUMERICAL MISMATCH" in m
+                    and (case["M"] > nkibench.GEMM_STATIONARY_FMAX
+                         or case["N"] > nkibench.GEMM_MOVING_FMAX)):
+                failure += (
+                    " This case needs multiple output tiles, while the smaller one-tile cases "
+                    "passed. Focus on the outer M/N tile coordinates and slice origins: use "
+                    "m0=mi*TILE_M, m1=min(m0+TILE_M, M), n0=ni*TILE_N, and "
+                    "n1=min(n0+TILE_N, N). For each K tile use "
+                    "lhsT[k0:k1, m0:m1] and rhs[k0:k1, n0:n1], then store the completed "
+                    "accumulator to out[m0:m1, n0:n1]. Do not use mi/ni directly as element "
+                    "offsets or swap the M and N offsets. lhsT is already [K,M]; do not "
+                    "transpose it. Allocate one (tile_m,tile_n) PSUM per output tile before "
+                    "the K loop, accumulate every K tile into it, and write that output tile "
+                    "once after the K loop."
+                )
+                index = re.search(r"at index \((\d+),\s*(\d+)\)", m)
+                if index:
+                    row, col = map(int, index.groups())
+                    tile_m = nkibench.GEMM_STATIONARY_FMAX
+                    tile_n = nkibench.GEMM_MOVING_FMAX
+                    m0 = (row // tile_m) * tile_m
+                    n0 = (col // tile_n) * tile_n
+                    failure += (
+                        f" The reported wrong element ({row},{col}) belongs to output tile "
+                        f"mi={m0 // tile_m}, ni={n0 // tile_n}, whose correct origins are "
+                        f"m0={m0}, n0={n0}. For this K={case['K']}, M={case['M']}, "
+                        f"N={case['N']} shape, load lhsT[k0:k1, {m0}:{min(m0 + tile_m, case['M'])}] "
+                        f"and rhs[k0:k1, {n0}:{min(n0 + tile_n, case['N'])}], then store that "
+                        f"tile to out[{m0}:{min(m0 + tile_m, case['M'])}, "
+                        f"{n0}:{min(n0 + tile_n, case['N'])}]. Do not change the K "
+                        "accumulation to fix this coordinate mismatch."
+                    )
+            failures.append((nkibench.label(case, level), failure))
             continue
         passed += 1
         if level >= 3 and counted["bytes"] and {"M", "K", "N"} <= set(case):
@@ -225,7 +261,12 @@ def copy_kernel(a):
 # rounds fixing that operation's API instead of computing a window average.
 POOL_METHOD = """Average pooling is a window reduction: sum each pool_size by pool_size window,
 then scale by 1.0 / (pool_size * pool_size). Keep channels on the partition axis.
-Use nl.sum for the reduction and nisa.tensor_scalar with op0=nl.multiply to scale.
+For the one .ap() on the ORIGINAL full input tile (C,H,W), use exactly this layout; every pair is
+[element_stride, count], and the first stride MUST be H*W:
+  view = in_tile.ap([[H*W, C], [pool_size*W, H//pool_size],
+                     [pool_size, W//pool_size], [W, pool_size], [1, pool_size]])
+Then use nl.sum(view, axis=[3, 4]) and nisa.tensor_scalar with op0=nl.multiply to scale.
+Do not use 0 or 1 as the first stride, and do not call .ap() on an already-created view.
 """
 
 POOL_API_CARD = """NKI pooling primitives:
@@ -234,9 +275,14 @@ POOL_API_CARD = """NKI pooling primitives:
   nisa.dma_copy(dst=tile, src=input_slice) loads a tile; both sides must have the
     same element count. Derive tile sizes from the input, with at most 128 channels.
     Preserve the channel axis when slicing, even for a single channel.
-  tile.ap([[stride, count], ...]) creates a view, with strides in ELEMENTS.
-    For pooling, group the tile as [channels, output_rows, output_cols, pool_rows,
-    pool_cols]. Derive strides from the original row width and pool_size.
+  tile.ap([[stride, count], ...]) creates a view, with strides in ELEMENTS. Each pair
+    is [element_stride, count]. For the original in_tile of shape (C,H,W), the exact
+    pooling view is:
+    in_tile.ap([[H*W, C], [pool_size*W, H//pool_size],
+                [pool_size, W//pool_size], [W, pool_size], [1, pool_size]])
+    The first stride H*W is mandatory (it is the original tile's free-dimension size);
+    do not use 0 or 1 there. Call .ap() once on in_tile, not on another view.
+    This produces [channels, output_rows, output_cols, pool_rows, pool_cols].
   sums = nl.sum(window_view, axis=[3, 4]) reduces the two window axes.
   scaled = nl.ndarray(sums.shape, dtype=sums.dtype, buffer=nl.sbuf)
   nisa.tensor_scalar(dst=scaled, data=sums, op0=nl.multiply,
@@ -244,6 +290,257 @@ POOL_API_CARD = """NKI pooling primitives:
   nisa.dma_copy(dst=output_slice, src=scaled) stores the matching output tile.
 """
 
+
+TILED_MATMUL_METHOD = """Read K, M = lhsT.shape and K_rhs, N = rhs.shape; return an (M, N) output.
+Tile all three dimensions: K at most 128, M at most 128, N at most 512 per tile.
+For each (M, N) output tile, allocate ONE float32 PSUM tile outside its K loop.
+Accumulate all K tiles into it, then copy and store the completed output tile.
+Use ceiling division (size+tile_size-1)//tile_size and Python min for edge sizes.
+M=128 must execute an M tile; M//512 is zero and leaves output unwritten.
+Slice lhsT as [k_start:k_end, m_start:m_end], since its axes are (K, M).
+"""
+
+TILED_MATMUL_API_CARD = """Use separate buffers with these tile shapes:
+  stationary input SBUF: (tile_k, tile_m), loaded from lhsT's K and M ranges
+  moving input SBUF:     (tile_k, tile_n), loaded from rhs's K and N ranges
+  accumulator PSUM:     (tile_m, tile_n), dtype nl.float32
+  result SBUF:          (tile_m, tile_n), dtype lhsT.dtype
+  returned shared HBM:  (M, N), dtype lhsT.dtype
+Allocate with nl.ndarray(shape, dtype=..., buffer=region), choosing nl.sbuf,
+nl.psum or nl.shared_hbm for the region according to the buffer's role.
+Use nl.affine_range for tile loops; derive bounds and partial-tile sizes from
+the input dimensions. Every DMA source slice must match its destination tile.
+The copy and matmul functions are in nki.isa, imported as nisa. Call them only
+as nisa.dma_copy(...), nisa.nc_matmul(...), and nisa.tensor_copy(...).
+There is no nl.dma_copy, nl.nc_matmul or nl.tensor_copy. Inside the K loop,
+call nisa.dma_copy(dst=left_tile, src=lhsT[k0:k1, m0:m1]) and
+nisa.dma_copy(dst=right_tile, src=rhs[k0:k1, n0:n1]), then call
+nisa.nc_matmul(dst=accumulator, stationary=left_tile, moving=right_tile).
+After that loop, call nisa.tensor_copy(dst=result_sbuf, src=accumulator).
+The result SBUF must match the accumulator's shape, not an input tile's shape.
+Store it with nisa.dma_copy into the matching M and N slice of the HBM output.
+"""
+
+
+HOIST_SHAPES = ("lhsT is (K, M) -- the left operand arrives TRANSPOSED, K on the partition axis -- "
+                "rhs is (K, N), and the result is (M, N). This level is scored on HBM BYTES as "
+                "well as correctness: a correct kernel that re-reads rhs for every output row "
+                "tile is level 4 and fails here. Read each rhs tile ONCE per column slab and "
+                "reuse it across every M tile.")
+
+HOIST_API_CARD = """Tile sizes come from the hardware, so read them off nl.tile_size:
+  tile_k = nl.tile_size.pmax                   # 128, the partition-axis maximum
+  tile_m = nl.tile_size.gemm_stationary_fmax   # 128
+  tile_n = nl.tile_size.gemm_moving_fmax       # 512
+A tile may never have more than tile_k partition rows. To hold several K tiles at once, DO NOT
+grow the partition axis -- pack them along the FREE axis and slice the one you need:
+  rhs_cache = nl.ndarray((tile_k, (K // tile_k) * tile_n), dtype=rhs.dtype, buffer=nl.sbuf)
+  ...
+  rhs_cache[:, k * tile_n:(k + 1) * tile_n]    # the k-th K tile, still 2-D, still tile_k rows
+The returned tensor is allocated ONCE, before every loop, and it is the only shared_hbm tile:
+  result = nl.ndarray((M, N), dtype=lhsT.dtype, buffer=nl.shared_hbm)
+Allocating it inside a loop gives each iteration a fresh uninitialised tile, so every tile but the
+last reads back as NaN. It must not live in nl.sbuf either: an (M, N) SBUF tile breaks the
+partition limit as soon as M > tile_k, and an SBUF tile is not what the caller receives.
+Never write into lhsT or rhs; they belong to the caller.
+The loop order is what buys the reuse -- N outermost, then the cache, then M, then K:
+  for n in nl.affine_range(N // tile_n):
+      rhs_cache = nl.ndarray((tile_k, (K // tile_k) * tile_n), dtype=rhs.dtype, buffer=nl.sbuf)
+      for k in nl.affine_range(K // tile_k):          # fill the cache ONCE for this slab
+          nisa.dma_copy(dst=rhs_cache[:, k * tile_n:(k + 1) * tile_n],
+                        src=rhs[k * tile_k:(k + 1) * tile_k, n * tile_n:(n + 1) * tile_n])
+      for m in nl.affine_range(M // tile_m):
+          accum = nl.ndarray((tile_m, tile_n), dtype=nl.float32, buffer=nl.psum)
+          for k in nl.affine_range(K // tile_k):      # accumulate into the SAME psum tile
+              left = nl.ndarray((tile_k, tile_m), dtype=lhsT.dtype, buffer=nl.sbuf)
+              nisa.dma_copy(dst=left, src=lhsT[k * tile_k:(k + 1) * tile_k,
+                                               m * tile_m:(m + 1) * tile_m])
+              nisa.nc_matmul(dst=accum, stationary=left,
+                             moving=rhs_cache[:, k * tile_n:(k + 1) * tile_n])
+          # Copy out through SBUF: psum cannot reach HBM directly, and `result` is the tile
+          # allocated once above -- do NOT allocate it here.
+          out_tile = nl.ndarray((tile_m, tile_n), dtype=lhsT.dtype, buffer=nl.sbuf)
+          nisa.tensor_copy(dst=out_tile, src=accum)
+          nisa.dma_copy(dst=result[m * tile_m:(m + 1) * tile_m,
+                                   n * tile_n:(n + 1) * tile_n], src=out_tile)
+  return result
+Allocate `accum` per output tile OUTSIDE the K loop, never inside it: a fresh psum tile per K step
+writes partial products out and reads them back, which is the traffic this level measures.
+Derive K, M and N from lhsT.shape and rhs.shape; do not hard-code the test sizes.
+"""
+
+BLOCK_SHAPES = ("lhsT is (K, M) -- the left operand arrives TRANSPOSED, K on the partition axis "
+                "-- rhs is (K, N), and the result is (M, N). This level is scored on HBM BYTES as "
+                "well as correctness, and more tightly than the level below it. Caching ONE rhs "
+                "column slab is not enough here: that still reloads each lhsT tile once per slab. "
+                "Hold SEVERAL slabs resident at once and load each lhsT tile once per BLOCK of "
+                "slabs, so rhs is read once, lhsT is read once per block, and the output is "
+                "written once.")
+
+BLOCK_API_CARD = """Tile sizes come from the hardware, so read them off nl.tile_size:
+  tile_k = nl.tile_size.pmax                   # 128, the partition-axis maximum
+  tile_m = nl.tile_size.gemm_stationary_fmax   # 128
+  tile_n = nl.tile_size.gemm_moving_fmax       # 512
+A tile may never have more than tile_k partition rows, so a cache holding several tiles packs
+them along the FREE axis and slices the one it needs. Never grow the partition axis to fit more.
+Choose the block size under a CAPACITY BOUND you state yourself, not from the shape -- that
+choice is the substance of this level. Keep it a divisor of the tile count so every loop bound
+stays an exact division and there is no ragged final block:
+  k_tiles, n_tiles, m_tiles = K // tile_k, N // tile_n, M // tile_m
+  BUDGET = 16384                                     # floats per partition you allow the cache
+  affordable = max(1, BUDGET // (k_tiles * tile_n))  # slabs that fit the budget
+  block_n = largest divisor of n_tiles that is <= affordable
+  n_blocks = n_tiles // block_n
+The returned tensor is allocated ONCE, before every loop, and is the only shared_hbm tile:
+  result = nl.ndarray((M, N), dtype=lhsT.dtype, buffer=nl.shared_hbm)
+Allocating it inside a loop hands each iteration a fresh uninitialised tile, so every tile but
+the last reads back as NaN. Never write into lhsT or rhs; they belong to the caller.
+The structure -- note that the lhsT load sits OUTSIDE the slab loop, which is the whole point:
+  for nb in nl.affine_range(n_blocks):
+      rhs_block = nl.ndarray((tile_k, block_n * k_tiles * tile_n),
+                             dtype=rhs.dtype, buffer=nl.sbuf)
+      for j in nl.affine_range(block_n):              # fill the block ONCE
+          for k in nl.affine_range(k_tiles):
+              col = (j * k_tiles + k) * tile_n
+              n0 = (nb * block_n + j) * tile_n
+              nisa.dma_copy(dst=rhs_block[:, col:col + tile_n],
+                            src=rhs[k * tile_k:(k + 1) * tile_k, n0:n0 + tile_n])
+      for m in nl.affine_range(m_tiles):
+          left_block = nl.ndarray((tile_k, k_tiles * tile_m),
+                                  dtype=lhsT.dtype, buffer=nl.sbuf)
+          for k in nl.affine_range(k_tiles):          # ONCE per block, NOT once per slab
+              nisa.dma_copy(dst=left_block[:, k * tile_m:(k + 1) * tile_m],
+                            src=lhsT[k * tile_k:(k + 1) * tile_k,
+                                     m * tile_m:(m + 1) * tile_m])
+          for j in nl.affine_range(block_n):
+              accum = nl.ndarray((tile_m, tile_n), dtype=nl.float32, buffer=nl.psum)
+              for k in nl.affine_range(k_tiles):      # accumulate into the SAME psum tile
+                  col = (j * k_tiles + k) * tile_n
+                  nisa.nc_matmul(dst=accum,
+                                 stationary=left_block[:, k * tile_m:(k + 1) * tile_m],
+                                 moving=rhs_block[:, col:col + tile_n])
+              out_tile = nl.ndarray((tile_m, tile_n), dtype=lhsT.dtype, buffer=nl.sbuf)
+              nisa.tensor_copy(dst=out_tile, src=accum)
+              n0 = (nb * block_n + j) * tile_n
+              nisa.dma_copy(dst=result[m * tile_m:(m + 1) * tile_m, n0:n0 + tile_n],
+                            src=out_tile)
+  return result
+Allocate `accum` per output tile OUTSIDE the K loop: a fresh psum tile per K step writes partial
+products out and reads them back, which is the traffic this level measures.
+Derive K, M and N from lhsT.shape and rhs.shape; do not hard-code the test sizes.
+"""
+
+FULL_SHAPES = ("lhsT is (K, M) -- the left operand arrives TRANSPOSED, K on the partition axis -- "
+               "rhs is (K, N), and the result is (M, N). This is the fully blocked level: block "
+               "K, N AND M. Reading each input once is necessary but no longer sufficient to make "
+               "this level interesting -- what is left is issuing FEWER, LARGER transfers. "
+               "Because lhsT is (K, M) its M axis is contiguous, so a whole block of M tiles is "
+               "one rectangular slice and moves in a SINGLE dma_copy per K tile, instead of one "
+               "per M tile. Same bytes, fewer transfers.")
+
+FULL_API_CARD = """Tile sizes come from the hardware, so read them off nl.tile_size:
+  tile_k = nl.tile_size.pmax                   # 128, the partition-axis maximum
+  tile_m = nl.tile_size.gemm_stationary_fmax   # 128
+  tile_n = nl.tile_size.gemm_moving_fmax       # 512
+Caches pack their tiles along the FREE axis and keep the partition axis at tile_k; never grow the
+partition axis to fit more. Size BOTH blocks under one capacity bound you state yourself, taking
+the rhs block first and giving the lhsT block what is left, and keep each a divisor of its tile
+count so no loop bound is ragged:
+  k_tiles, n_tiles, m_tiles = K // tile_k, N // tile_n, M // tile_m
+  BUDGET = 16384                                          # floats per partition, your choice
+  block_n = largest divisor of n_tiles <= BUDGET // (k_tiles * tile_n)
+  remaining = BUDGET - block_n * k_tiles * tile_n
+  block_m = largest divisor of m_tiles <= remaining // (k_tiles * tile_m)
+  n_blocks, m_blocks = n_tiles // block_n, m_tiles // block_m
+The returned tensor is allocated ONCE, before every loop, and is the only shared_hbm tile:
+  result = nl.ndarray((M, N), dtype=lhsT.dtype, buffer=nl.shared_hbm)
+Allocating it inside a loop hands each iteration a fresh uninitialised tile, so every tile but
+the last reads back as NaN. Never write into lhsT or rhs; they belong to the caller.
+The structure -- note the single lhsT transfer per K tile covering `span` columns:
+  for nb in nl.affine_range(n_blocks):
+      rhs_block = nl.ndarray((tile_k, block_n * k_tiles * tile_n),
+                             dtype=rhs.dtype, buffer=nl.sbuf)
+      for j in nl.affine_range(block_n):
+          for k in nl.affine_range(k_tiles):
+              col = (j * k_tiles + k) * tile_n
+              n0 = (nb * block_n + j) * tile_n
+              nisa.dma_copy(dst=rhs_block[:, col:col + tile_n],
+                            src=rhs[k * tile_k:(k + 1) * tile_k, n0:n0 + tile_n])
+      for mb in nl.affine_range(m_blocks):
+          m0 = mb * block_m * tile_m
+          span = block_m * tile_m
+          left_block = nl.ndarray((tile_k, k_tiles * span), dtype=lhsT.dtype, buffer=nl.sbuf)
+          for k in nl.affine_range(k_tiles):          # ONE transfer per K tile, whole M block
+              nisa.dma_copy(dst=left_block[:, k * span:(k + 1) * span],
+                            src=lhsT[k * tile_k:(k + 1) * tile_k, m0:m0 + span])
+          for i in nl.affine_range(block_m):          # the M tiles inside this block
+              for j in nl.affine_range(block_n):
+                  accum = nl.ndarray((tile_m, tile_n), dtype=nl.float32, buffer=nl.psum)
+                  for k in nl.affine_range(k_tiles):  # accumulate into the SAME psum tile
+                      left_col = k * span + i * tile_m
+                      rhs_col = (j * k_tiles + k) * tile_n
+                      nisa.nc_matmul(dst=accum,
+                                     stationary=left_block[:, left_col:left_col + tile_m],
+                                     moving=rhs_block[:, rhs_col:rhs_col + tile_n])
+                  out_tile = nl.ndarray((tile_m, tile_n), dtype=lhsT.dtype, buffer=nl.sbuf)
+                  nisa.tensor_copy(dst=out_tile, src=accum)
+                  row, n0 = m0 + i * tile_m, (nb * block_n + j) * tile_n
+                  nisa.dma_copy(dst=result[row:row + tile_m, n0:n0 + tile_n], src=out_tile)
+  return result
+BOTH inner loops are required. An output tile is identified by an (i, j) pair, so the block needs
+the loop over its M tiles AND the loop over its N slabs. Dropping the slab loop computes only the
+first slab of each block and leaves the rest of the output untouched, which the checker reports as
+non-finite -- indistinguishable from an uninitialised tile. The number of tiles you store must
+come to (M // tile_m) * (N // tile_n), with one psum accumulator per pair.
+The STORE cannot be merged the same way: an output tile is tile_m partition rows, and a block of
+them would exceed the partition maximum, so store one tile at a time. Only the lhsT load merges.
+Allocate `accum` per output tile OUTSIDE the K loop, never inside it.
+Derive K, M and N from lhsT.shape and rhs.shape; do not hard-code the test sizes.
+"""
+
+
+TILED_MATMUL_SKELETON = """Repair this kernel by returning this complete tiled matmul structure.
+Preserve the index calculations exactly: mi and ni are tile indices, while m0 and n0 are
+element offsets. Do not transpose lhsT; it is already [K,M]. The level's shapes are divisible
+by these hardware tile limits.
+
+```python
+import nki
+import nki.language as nl
+import nki.isa as nisa
+
+@nki.jit
+def nki_matmul_tiled_(lhsT, rhs):
+    K, M = lhsT.shape
+    K_rhs, N = rhs.shape
+    assert K == K_rhs
+    TILE_M = nl.tile_size.gemm_stationary_fmax
+    TILE_K = nl.tile_size.pmax
+    TILE_N = nl.tile_size.gemm_moving_fmax
+    assert M % TILE_M == 0 and K % TILE_K == 0 and N % TILE_N == 0
+    out = nl.ndarray((M, N), dtype=lhsT.dtype, buffer=nl.shared_hbm)
+
+    for mi in nl.affine_range(M // TILE_M):
+        m0 = mi * TILE_M
+        m1 = m0 + TILE_M
+        for ni in nl.affine_range(N // TILE_N):
+            n0 = ni * TILE_N
+            n1 = n0 + TILE_N
+            acc = nl.ndarray((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
+            for ki in nl.affine_range(K // TILE_K):
+                k0 = ki * TILE_K
+                k1 = k0 + TILE_K
+                left = nl.ndarray((TILE_K, TILE_M), dtype=lhsT.dtype, buffer=nl.sbuf)
+                right = nl.ndarray((TILE_K, TILE_N), dtype=rhs.dtype, buffer=nl.sbuf)
+                nisa.dma_copy(dst=left, src=lhsT[k0:k1, m0:m1])
+                nisa.dma_copy(dst=right, src=rhs[k0:k1, n0:n1])
+                nisa.nc_matmul(dst=acc, stationary=left, moving=right)
+            result = nl.ndarray((TILE_M, TILE_N), dtype=lhsT.dtype, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=result, src=acc)
+            nisa.dma_copy(dst=out[m0:m1, n0:n1], src=result)
+    return out
+```
+"""
 
 MATMUL_SHAPES = """This is a single-tile matmul. Read K, M = lhsT.shape and K_rhs, N = rhs.shape.
 The input shapes are (K, M) and (K, N); the output shape is (M, N).
@@ -268,6 +565,65 @@ then store result to output with nisa.dma_copy(dst=, src=) and return output.
 Both result copies preserve the (M, N) shape; an input tile has a different role
 and shape, so using it as the result buffer loses the required dimensions.
 """
+
+
+def hoist_result_hint(msg):
+    """Level 5 only: name the output-buffer mistake behind a non-finite or zeroed result.
+
+    Measured on seat 21: once the rhs cache is right, the remaining failure is the copy-out. The
+    model allocated `result = nl.ndarray((M, N), ..., buffer=nl.sbuf)` INSIDE the m loop, so every
+    output tile but the last read back as NaN (3 of 4 tiles on K=256 M=256 N=1024), and returned an
+    SBUF tile that never reached HBM. The generic verdict blames an uninitialised PSUM tile, which
+    sends the model to re-check accumulation that was already correct.
+    """
+    if "NON-FINITE OUTPUT" in msg or "OUTPUT IS" in msg or "of the output is zero" in msg:
+        return (msg + " For this level the accumulation is NOT the problem. Untouched output "
+                "memory is, and there are exactly two ways to leave some:\n"
+                "(1) INCOMPLETE LOOP COVERAGE -- the usual cause when a clean FRACTION of the "
+                "output is NaN (a half, a quarter). Every output tile is identified by a pair of "
+                "indices, so a block needs BOTH inner loops: one over the M tiles in the block "
+                "AND one over the N slabs in the block. Dropping the slab loop computes only the "
+                "first slab of each block and leaves the rest untouched, which looks exactly like "
+                "an uninitialised tile. Count the tiles you actually store: it must equal "
+                "(M // tile_m) * (N // tile_n), with one psum accumulator per pair.\n"
+                "(2) THE OUTPUT BUFFER -- allocate the returned tensor exactly once, BEFORE every "
+                "loop, as result = nl.ndarray((M, N), dtype=lhsT.dtype, buffer=nl.shared_hbm). "
+                "Allocating it inside a loop hands each iteration a fresh uninitialised tile, so "
+                "only the last tile written is real.\n"
+                "If `result` is already allocated once before every loop, the cause is (1), so "
+                "check the loop nest rather than the allocation. Copy each finished tile out in "
+                "two steps, because psum cannot reach HBM: "
+                "nisa.tensor_copy(dst=out_tile, src=accum) into a (tile_m, tile_n) nl.sbuf tile, "
+                "then nisa.dma_copy into the matching rows and columns of `result`. Return "
+                "`result`, and never write into lhsT or rhs.")
+    return msg
+
+
+def transpose_result_hint(msg):
+    """Level 2 only: say WHY the checker's generic verdict happened for a transpose kernel.
+
+    Measured on seat 21: kernels wrote the result back into x with dma_copy(dst=x[...]) and
+    returned x or nothing ("MODIFIED ITS INPUT"), and kernels that copied only partition 0 with
+    tile[nl.ds(0, 1), c] left every other row uninitialised ("NON-FINITE", first NaN at row 1).
+    The generic messages blame PSUM or give no cause, so the model repeated both.
+    """
+    if "THE KERNEL MODIFIED ITS INPUT" in msg:
+        return (msg + " For this level: do not use x as a destination anywhere (no "
+                "dma_copy(dst=x[...]), no x[...] = ...). Load x into an SBUF tile, build the "
+                "transposed row layout in a SECOND SBUF tile, then "
+                "out = nl.ndarray(x.shape, dtype=x.dtype, buffer=nl.shared_hbm); "
+                "nisa.dma_copy(dst=out, src=output_tile); return out.")
+    if "NON-FINITE OUTPUT" in msg:
+        return (msg + " For this level the cause is output memory that was never written, not "
+                "PSUM. Two common ways: (1) a view like tile[nl.ds(0, 1), c] or "
+                "output_tile[i, c] touches one partition only; (2) the copies write into the "
+                "INPUT tile (e.g. input_tile[...] = input_tile[...]) so the output tile that is "
+                "stored stays empty. Every copy must read from the input tile and write the "
+                "output tile, on whole-partition column views: "
+                "nisa.tensor_copy(dst=output_tile[:, nl.ds(j*F1+i, 1)], "
+                "src=input_tile[:, nl.ds(i*F2+j, 1)]) for each (i, j). Then "
+                "nisa.dma_copy(dst=out, src=output_tile) with the full (rows, F) tile.")
+    return msg
 
 
 def available_names(dotted):
@@ -311,17 +667,120 @@ def real_signature(func_name):
     return ""
 
 
-def enrich(error_text, level=None):
+def enrich(error_text, level=None, shape=None):
     """Add the real names when the failure is an invented API call.
 
     `level` is optional so existing callers keep working; it lets a level-specific message fire
     (used for the level-1 pooling load/reduce idiom below).
     """
+    if (level == 2 and "positional argument" in error_text.lower()
+            and "were given" in error_text.lower()):
+        import inspect
+        spec = nkibench.LEVELS[2]
+        params = ", ".join(inspect.signature(spec["ref"]).parameters)
+        return (error_text + f" The harness calls `{spec['entry']}` with exactly two arguments: "
+                f"({params}). Define the entry point as `def {spec['entry']}({params}):` "
+                "with `@nki.jit` above it. Keep `shape2D` as a runtime argument; do not drop it "
+                "or hard-code the current test shape. Return the transposed data with the same "
+                "shape and dtype as `x`.")
+    if level == 4 and "NON-FINITE OUTPUT" in error_text:
+        detail = (
+            " Check output-tile coverage: allocate one PSUM for each (M,N) output tile "
+            "before its K loop, accumulate every K tile, copy PSUM to a same-shaped SBUF, "
+            "then DMA that SBUF to the matching HBM output slice. Every output tile must "
+            "be written exactly once; do not read an uninitialized PSUM/SBUF or rely on "
+            "a fresh shared-HBM output being zeroed."
+        )
+        index = re.search(r"first at \((\d+),\s*(\d+)\)", error_text)
+        if shape and index:
+            row, col = map(int, index.groups())
+            tile_m = nkibench.GEMM_STATIONARY_FMAX
+            tile_n = nkibench.GEMM_MOVING_FMAX
+            m0 = (row // tile_m) * tile_m
+            n0 = (col // tile_n) * tile_n
+            detail += (
+                f" The failing shape is M={shape['M']}, N={shape['N']}; the first NaN at "
+                f"({row},{col}) lies in output tile starting at m0={m0}, n0={n0} "
+                f"(tile indices mi={m0 // tile_m}, ni={n0 // tile_n}). Check that this "
+                f"tile's operands load lhsT[k0:k1, m0:m1] and rhs[k0:k1, n0:n1], and "
+                f"that its result is stored to out[m0:m1, n0:n1]. Compute element offsets "
+                f"as mi*TILE_M and ni*TILE_N, not directly from mi/ni; derive tile counts "
+                f"with ceiling division and bound ends with min(start+tile_size, dimension)."
+            )
+        return error_text + detail
+    if level == 1 and "ap() pattern has invalid partition stride" in error_text.lower():
+        detail = (
+            " The access pattern must be applied ONCE to the original full-input SBUF tile "
+            "with shape (C,H,W), not to a pooled/output tile or another view. Replace the "
+            "entire pattern with exactly `in_tile.ap([[H*W, C], "
+            "[pool_size*W, H//pool_size], [pool_size, W//pool_size], "
+            "[W, pool_size], [1, pool_size]])`. Each pair is [element_stride, count]. "
+            "The first stride must be H*W because that is the original tile's free-dimension "
+            "size; never use 0 or 1 there. This pattern gives "
+            "[C, H//pool_size, W//pool_size, pool_size, pool_size]; reduce axes [3,4] and "
+            "scale by 1/(pool_size*pool_size). Keep the full input tile shape for DMA."
+        )
+        if shape:
+            dims = shape.get("shape")
+            pool_size = shape.get("pool_size")
+            if dims and pool_size:
+                channels, height, width = dims
+                p = pool_size
+                exact = [
+                    [height * width, channels],
+                    [p * width, height // p],
+                    [p, width // p],
+                    [width, p],
+                    [1, p],
+                ]
+                detail += (
+                    f" For this failing case C,H,W={dims}, pool_size={p}, the exact "
+                    f"numeric pattern is `{exact}`. In the general kernel, spell those "
+                    "five pairs with the input shape variables as shown above; do not "
+                    "copy the numeric test values as hard-coded constants."
+                )
+        return error_text + detail
+    if level == 4 and (
+            "module 'nki.isa' has no attribute 'fill'" in error_text
+            or "module 'nki.language' has no attribute 'temporary'" in error_text):
+        return (error_text + " Check whether output-writing loops execute: use tile_m<=128 and "
+                "ceiling division for tile counts, with bounded edge slices. Allocate one PSUM "
+                "per (M,N) tile outside its K loop, load both operands, accumulate every K tile, "
+                "then copy to a matching SBUF and DMA to the output slice. The shipped pattern "
+                "needs no manual fill; a new ndarray is not initialized to zero.")
+    if level == 4:
+        missing = re.search(
+            r"module 'nki\.language' has no attribute '(dma_copy|nc_matmul|tensor_copy)'",
+            error_text)
+        if missing:
+            name = missing.group(1)
+            return (error_text + f" {name} belongs to nki.isa, not nki.language. "
+                    f"Use nisa.{name}(...) after `import nki.isa as nisa`. "
+                    "The Level 4 calls are nisa.dma_copy(dst=..., src=...), "
+                    "nisa.nc_matmul(dst=..., stationary=..., moving=...), and "
+                    "nisa.tensor_copy(dst=..., src=...). Keep operands in SBUF, "
+                    "the accumulator in PSUM, and store each completed output tile once.")
     if "'MemoryRegion' object is not callable" in error_text:
         return (error_text + " nl.sbuf, nl.psum and nl.shared_hbm are memory regions, not "
                 "functions. Do not call them. Allocate with "
                 "nl.ndarray(shape, dtype=nl.float32, buffer=nl.sbuf) and pass the region as the "
                 "buffer= argument.")
+    # A tile handed to a positional slot that is not dst or src. Measured on branch_final: the
+    # model called nisa.tensor_copy with a third positional argument, so the tile landed in
+    # `engine`, and with no handler the raw assertion taught it nothing and it invented
+    # `tile_shape=` on the next round instead.
+    m = re.search(r"(\w+) engine must be one of \[([^\]]+)\], got", error_text)
+    if m:
+        fn, allowed = m.group(1), m.group(2)
+        sig = real_signature(fn)
+        return (error_text.split("\n")[0]
+                + f" You passed a TILE into the `engine` parameter. `nisa.{fn}` takes its two "
+                f"tiles as KEYWORDS and nothing else: nisa.{fn}(dst=..., src=...). Do not pass a "
+                f"third positional argument -- the third slot is `engine`, which only accepts one "
+                f"of [{allowed}] and is better left out entirely."
+                + (f" The real signature is {sig}." if sig else "")
+                + " Invent no other arguments: there is no tile_shape=, shape=, size= or axis= on "
+                  "this function.")
     m = re.search(r"(\w+)\(\) got an unexpected keyword argument '(\w+)'", error_text)
     if m:
         sig = real_signature(m.group(1))
@@ -368,6 +827,21 @@ def enrich(error_text, level=None):
                 f"nisa.dma_copy(dst=t, src=a[0:128, 0:512]) -- the slice on the right must have the "
                 f"same shape as the tile on the left.")
     m = re.search(r"dma_copy (\w+) partition dimension (\d+) exceeds maximum (\d+)", error_text)
+    if m and level in (5, 6, 7):
+        # The generic advice below -- "loop over the partition dimension in chunks" -- is actively
+        # wrong on these levels: chunking the cache means re-reading it, which the byte bar
+        # penalises. Measured on seat 21: the level-5 and level-6 baselines both cycled four
+        # rounds on this message before this branch existed.
+        which, got, mx = m.group(1), int(m.group(2)), int(m.group(3))
+        return (error_text + f" A tile may have at most {mx} partition rows and you asked for "
+                f"{got}, so the cache cannot hold the K axis on the partition axis. Do NOT fix "
+                f"this by looping over the partition dimension in {mx}-row chunks -- re-reading "
+                f"is exactly what this level's byte budget penalises. Keep the partition axis at "
+                f"ONE K tile and pack the K tiles along the FREE axis instead: allocate "
+                f"nl.ndarray(({mx}, (K // {mx}) * tile_n), dtype=rhs.dtype, buffer=nl.sbuf) and "
+                f"address the k-th tile as cache[:, k * tile_n:(k + 1) * tile_n], which is still "
+                f"2-D and still {mx} rows. Fill that cache once in the outer loop, then reuse it "
+                f"for every M tile.")
     if m:
         which, got, mx = m.group(1), int(m.group(2)), int(m.group(3))
         return (error_text + f" A tile may have at most {mx} rows, and you asked for {got}. Do not "
@@ -417,10 +891,20 @@ def enrich(error_text, level=None):
                     "tensor_copy input[:, nl.ds(i*F2+j, 1)] into "
                     "output[:, nl.ds(j*F1+i, 1)]. Store every output row via DMA.")
     m = re.search(r"Out-of-bound access for tensor .*? on dimension (\d+): "
-                  r"index range \[(\d+), (\d+)\] exceed dimension size of (\d+)",
+                  r"(?:index range \[(\d+), (\d+)\]|start index (\d+)) "
+                  r"exceed dimension size of (\d+)",
                   error_text)
     if m:
-        dim, hi, size = m.group(1), int(m.group(3)), int(m.group(4))
+        dim = m.group(1)
+        hi = int(m.group(3) or m.group(4))
+        size = int(m.group(5))
+        if level == 4:
+            return (error_text + f" The requested start {hi} is not a valid tile origin for "
+                    f"dimension {dim} of length {size}; compute origins only once: "
+                    "m0=mi*TILE_M, n0=ni*TILE_N, k0=ki*TILE_K. Use these offsets in "
+                    "lhsT[k0:k1,m0:m1], rhs[k0:k1,n0:n1], and out[m0:m1,n0:n1]. "
+                    "Use min(start+tile_size, dimension) for bounds; do not scale an offset "
+                    "twice, swap axes, or use tile indices directly as element offsets.")
         return (error_text + f" You indexed up to {hi} on dimension {dim}, which is only {size} "
                 f"long. Tile limits are a MAXIMUM, not a target. Derive every bound from the tensor's "
                 f"own shape -- use min(limit, size) and let the final chunk be partial -- rather than "
@@ -435,17 +919,23 @@ def enrich(error_text, level=None):
                 f"the partial products add up there, and only after the loop copy it out with "
                 f"nisa.tensor_copy. Do not allocate a new psum tile per chunk and do not write partial "
                 f"results to HBM.")
-    m = re.search(r"(\w+) (?:dst|src)? ?must be in \['sbuf', 'psum'\], got shared_hbm", error_text)
+    # Match ANY hbm region, not just shared_hbm. Measured on branch_final: the simulator reported
+    # `got private_hbm` and the old `got shared_hbm` pattern missed it, so the level-2 repair loop
+    # received no guidance and cycled on the identical failure at reward 0.30.
+    m = re.search(r"(\w+) (?:dst|src)? ?must be in \['sbuf', 'psum'\], got (\w*hbm)", error_text)
     if m and level == 2:
         return (error_text + f" `nisa.{m.group(1)}` needs on-chip tiles, but the tile you passed "
-                f"was allocated with buffer=nl.shared_hbm. Change the INPUT and OUTPUT WORK tiles "
-                f"to buffer=nl.sbuf: nl.ndarray((rows, F), dtype=x.dtype, buffer=nl.sbuf). Keep "
-                f"shared_hbm only for the single `out` tensor you return. Do not replace "
-                f"tensor_copy with dma_copy for the element moves.")
+                f"was allocated in {m.group(2)}. Every WORK tile belongs in SBUF: "
+                f"nl.ndarray((rows, F), dtype=x.dtype, buffer=nl.sbuf). The ONLY tile that uses "
+                f"nl.shared_hbm is the single `out` tensor you return, and nl.private_hbm is "
+                f"never needed on this level. Keep nisa.tensor_copy for the element moves between "
+                f"the two SBUF tiles, and use nisa.dma_copy only to load x into SBUF and to store "
+                f"the finished output tile into `out`.")
     if m:
         return (error_text + f" `nisa.{m.group(1)}` only moves data between on-chip buffers, sbuf and "
-                f"psum. To reach HBM -- the tensor you allocated with buffer=nl.shared_hbm and will "
-                f"return -- use nisa.dma_copy instead. The usual sequence is nc_matmul into psum, "
+                f"psum, but the tile you passed is in {m.group(2)}. To reach HBM -- the tensor you "
+                f"allocated with buffer=nl.shared_hbm and will return -- use nisa.dma_copy "
+                f"instead. The usual sequence is nc_matmul into psum, "
                 f"tensor_copy psum to sbuf, then dma_copy sbuf to the shared_hbm output.")
     m = re.search(r"(\w+) must be in \['(\w+)'\], got (\w+)", error_text)
     if m:
@@ -571,20 +1061,87 @@ def first_prompt(level, terse=0, a=None):
     """
     s = nkibench.LEVELS[level]
     import inspect
-    # Optional, flag-gated prompt segments. Assigned once here so every branch below (including
-    # the level-3 matmul card and the generic default) can reference them without a NameError.
+    # Optional prompt segments are shared by every level-specific prompt branch.
     tiles_seg, skill_seg = _extras(a, level) if a is not None else ("", "")
     tools_seg = _tools_preamble(a) if a is not None and getattr(a, "tools", None) else ""
+    if level == 2:
+        # The harness supplies both parameters from ref_transpose2d. Spell out the exact public
+        # entry signature so the model cannot emit a one-argument kernel that fails before NKI
+        # simulation begins.
+        return _assemble(a or _Dummy(), dict(
+            task=(f"Write an AWS Neuron NKI kernel `{s['entry']}` decorated with @nki.jit that "
+                  "transposes each row's free dimensions according to the given shape2D."),
+            signature=(f"Required function signature, exactly: `def {s['entry']}(x, shape2D):`. "
+                       "The harness calls this entry point with TWO positional arguments in this "
+                       "order: x, then shape2D. Keep both parameters; shape2D is runtime input, "
+                       "not a constant to hard-code."),
+            shapes=("x has shape (P, F), shape2D is (F1, F2), and F=F1*F2. Transpose only the "
+                    "two free dimensions within each partition row; return shape (P, F) and x.dtype."),
+            method=("Keep the partition axis P intact. Use separate SBUF input and output tiles "
+                    "with shape (rows, F), where rows=min(128, P-start). For each i in F1 and j "
+                    "in F2, copy input[:, nl.ds(i*F2+j, 1)] to output[:, "
+                    "nl.ds(j*F1+i, 1)] with nisa.tensor_copy. DMA each completed output tile "
+                    "to the returned shared-HBM tensor."),
+            # Measured on branch_final: with the roles described but no allocation shown, the
+            # model invented `nl.allocate_output` and put a work tile in nl.private_hbm. These
+            # are the only three allocations this level needs, so state them literally.
+            allocations=("Allocate with nl.ndarray only -- there is no nl.allocate_output or "
+                         "similar. Exactly three tiles, and no others:\n"
+                         "  out         = nl.ndarray(x.shape, dtype=x.dtype, buffer=nl.shared_hbm)"
+                         "   # the ONLY hbm tile; return this\n"
+                         "  input_tile  = nl.ndarray((rows, F), dtype=x.dtype, buffer=nl.sbuf)\n"
+                         "  output_tile = nl.ndarray((rows, F), dtype=x.dtype, buffer=nl.sbuf)\n"
+                         "nisa.tensor_copy moves data only between SBUF tiles, so a tile it "
+                         "touches must never be in nl.shared_hbm or nl.private_hbm. Never write "
+                         "into x. Shape sizes and offsets are Python integers: use Python "
+                         "min(128, P-start), not nl.min, which reduces a tensor."),
+            # Measured on branch_final: described in prose, the model guessed the call form --
+            # a third positional argument (which lands in `engine`) and an invented tile_shape=.
+            calls=("Use exactly these calls, with these keywords and NO other arguments:\n"
+                   "  nisa.dma_copy(dst=input_tile, src=x[start:start + rows, :])\n"
+                   "  nisa.tensor_copy(dst=output_tile[:, nl.ds(j * F1 + i, 1)],\n"
+                   "                   src=input_tile[:, nl.ds(i * F2 + j, 1)])\n"
+                   "  nisa.dma_copy(dst=out[start:start + rows, :], src=output_tile)\n"
+                   "nisa.tensor_copy takes dst and src only. Passing a third positional argument "
+                   "puts a tile into its `engine` parameter and fails; there is no tile_shape=, "
+                   "shape=, size= or axis= argument on it. The column views keep all `rows` "
+                   "partitions, so one call moves a whole column."),
+            imports="Import nki, nki.language as nl, and nki.isa as nisa.",
+            tiles=tiles_seg, skills=skill_seg, tools=tools_seg,
+            reply="Return one concise, complete Python code block with imports and the kernel."))
+    if level == 4:
+        card = TILED_MATMUL_API_CARD if terse == 0 else (
+            "Use separate (tile_k,tile_m) and (tile_k,tile_n) SBUF operands, one "
+            "(tile_m,tile_n) float32 PSUM per output tile outside the K loop, then "
+            "copy PSUM to a same-shaped SBUF and store it. Call transfers and matmul "
+            "only as nisa.dma_copy, nisa.nc_matmul, and nisa.tensor_copy; never nl.*.\n")
+        if terse >= 2:
+            card = ("Use nisa.dma_copy for transfers, nisa.nc_matmul for accumulation, "
+                    "and nisa.tensor_copy to move the completed PSUM to SBUF.\n")
+        return _assemble(a or _Dummy(), dict(
+            task=(f"Write an AWS Neuron NKI kernel `{s['entry']}` decorated with @nki.jit. "
+                  f"Compute exactly what this NumPy reference computes:\n\n"
+                  f"{inspect.getsource(s['ref'])}"),
+            rules=(f"Hardware limits: partition dimension <= {nkibench.PMAX}; tile M and N "
+                   "as well as K. Include import nki, import nki.language as nl, and "
+                   "import nki.isa as nisa."),
+            matmul=TILED_MATMUL_METHOD, api_card=card, tiles=tiles_seg,
+            skill=skill_seg, tools=tools_seg,
+            reply="Reply with one complete Python code block containing imports and function."))
     if level == 1:
         # A task-specific card avoids teaching matmul's PSUM workflow to a
         # reduction. Retain the operation and scalar API when shortening retries.
         card = POOL_API_CARD if terse == 0 else (
             "Allocate with nl.ndarray(shape, dtype=..., buffer=nl.sbuf); return an "
             "nl.shared_hbm output. Move matching slices with nisa.dma_copy(dst=, src=). "
-            "Use tile.ap([[stride, count], ...]) to group windows, nl.sum(view, axis=[3, 4]), "
+            "On the original (C,H,W) input tile use ap([[H*W,C],[p*W,H//p], "
+            "[p,W//p],[W,p],[1,p]]) (pairs are [stride,count]; first stride MUST be H*W). "
+            "Then nl.sum(view, axis=[3, 4]), "
             "then nisa.tensor_scalar(dst=, data=, op0=nl.multiply, operand0=).\n")
         if terse >= 2:
-            card = "Scale with nisa.tensor_scalar(dst=, data=, op0=nl.multiply, operand0=).\n"
+            card = ("On the original input tile (C,H,W), use ap([[H*W,C],[p*W,H//p], "
+                    "[p,W//p],[W,p],[1,p]]); first stride MUST be H*W. Sum axes [3,4], "
+                    "then scale with nisa.tensor_scalar(op0=nl.multiply).\n")
         return (
             f"Write an AWS Neuron NKI kernel named `{s['entry']}`, decorated with @nki.jit.\n"
             f"Compute exactly what this NumPy reference computes:\n\n"
@@ -630,7 +1187,7 @@ def first_prompt(level, terse=0, a=None):
               "return. The left operand is already transposed, with K on the partition axis."
               if level >= 3 else "")
         # Level 1's substance is the pooling access pattern: load the whole input, reduce after.
-        pool = (POOL_SHAPES + " Load the full input into an in_tensor.shape SBUF tile, then build "
+        pool = (POOL_METHOD + " Load the full input into an in_tensor.shape SBUF tile, then build "
                 "an in_tile.ap([...]) view that groups each pool window onto the last axes and "
                 "nl.sum over them, scaling by 1/(pool_size*pool_size). Write that into a SEPARATE "
                 "smaller output tile." if level == 1 else "")
@@ -645,7 +1202,14 @@ def first_prompt(level, terse=0, a=None):
             reply="Reply with one python code block."))
     # Level 1 gets the dedicated pooling card instead of the generic API card, mirroring the
     # matmul levels' dedicated card -- same pattern, different operation.
-    pool_card = (POOL_SHAPES + "\n\n" + POOL_API_CARD) if level == 1 else ""
+    pool_card = (POOL_METHOD + "\n\n" + POOL_API_CARD) if level == 1 else ""
+    # Levels 5-7 take the GENERIC path with their card slotted in as the api_card, which is
+    # exactly how they were wired on fix/kernel-agent-level7 when each measured solved 3/3.
+    # An earlier port used a bespoke early return here instead; that dropped the "Hardware
+    # limits" rules segment from their prompt and level 7 then failed, so keep this faithful.
+    hoist_card = {5: HOIST_SHAPES + "\n\n" + HOIST_API_CARD,
+                  6: BLOCK_SHAPES + "\n\n" + BLOCK_API_CARD,
+                  7: FULL_SHAPES + "\n\n" + FULL_API_CARD}.get(level, "")
     return _assemble(a or _Dummy(), dict(
         task=(f"Write an AWS Neuron NKI kernel.\n\n"
               f"Operation: {s['op']}\n"
@@ -656,7 +1220,8 @@ def first_prompt(level, terse=0, a=None):
                f"matmul, the stationary free dimension is at most {nkibench.GEMM_STATIONARY_FMAX} "
                f"and the moving free dimension at most {nkibench.GEMM_MOVING_FMAX}.\n\n"
                f"Import nki, nki.language as nl, and nki.isa as nisa."),
-        api_card=pool_card or API_CARD, tiles=tiles_seg, skill=skill_seg, tools=tools_seg,
+        api_card=pool_card or hoist_card or API_CARD, tiles=tiles_seg, skill=skill_seg,
+        tools=tools_seg,
         reply="Reply with ONE python code block containing the imports and the function. No prose."))
 
 
@@ -665,12 +1230,58 @@ class _Dummy:
     _last_seg = {}
 
 
-def repair_prompt(level, source, feedback, a=None, ledger=""):
+def repair_prompt(level, source, feedback, a=None, ledger="", scaffold=False):
     """One named change, and the previous code. No rules list, no reference re-sent.
 
     The lesson this whole repo keeps re-learning: feeding a verifier's report back verbatim
     reproduces the same mistake, because a report says what is wrong and never what to do.
     """
+    if (level == 2 and "positional argument" in feedback.lower()
+            and "were given" in feedback.lower()):
+        import inspect
+        spec = nkibench.LEVELS[2]
+        params = ", ".join(inspect.signature(spec["ref"]).parameters)
+        return (
+            f"Repair this NKI transpose kernel. The current code is:\n\n```python\n{source}\n```\n\n"
+            f"Checker error: {feedback}\n\n"
+            f"The harness calls `{spec['entry']}` with exactly two positional arguments: "
+            f"({params}). The decorated entry-point signature must be exactly:\n"
+            f"@nki.jit\ndef {spec['entry']}({params}):\n"
+            "Preserve both parameters. Use `shape2D` at runtime; "
+            "do not hard-code the current test's (3, 4). Keep the transpose implementation and "
+            "return the output with x.shape and x.dtype. Reply with one concise, complete Python "
+            "code block including imports.")
+    if level == 2:
+        # Every other level-2 failure used to fall through to the generic repair prompt, which
+        # re-sends the verdict and no structure. Measured on branch_final: the loop cycled at
+        # reward 0.30 across four rounds. Re-assert the allocation contract on every repair.
+        return (
+            f"Repair this NKI per-partition transpose:\n\n```python\n{source}\n```\n\n"
+            f"A checker reports:\n{feedback}\n\n"
+            f"x has shape (P, F), shape2D is (F1, F2) with F = F1*F2. Transpose ONLY the two free "
+            f"dimensions inside each partition row; the partition axis P stays put. Return shape "
+            f"(P, F) with x.dtype.\n"
+            f"Allocate with nl.ndarray only -- there is no nl.allocate_output. Exactly three "
+            f"tiles:\n"
+            f"  out         = nl.ndarray(x.shape, dtype=x.dtype, buffer=nl.shared_hbm)  # return this\n"
+            f"  input_tile  = nl.ndarray((rows, F), dtype=x.dtype, buffer=nl.sbuf)\n"
+            f"  output_tile = nl.ndarray((rows, F), dtype=x.dtype, buffer=nl.sbuf)\n"
+            f"with rows = min(128, P - start) using Python min. nisa.tensor_copy moves data only "
+            f"between SBUF tiles, so neither side may be in nl.shared_hbm or nl.private_hbm. For "
+            f"each i in F1 and j in F2, move one column with exactly this call -- two keywords, "
+            f"no third argument:\n"
+            f"  nisa.tensor_copy(dst=output_tile[:, nl.ds(j * F1 + i, 1)],\n"
+            f"                   src=input_tile[:, nl.ds(i * F2 + j, 1)])\n"
+            f"A third positional argument lands in `engine` and fails, and there is no "
+            f"tile_shape=, shape= or size= argument. These are full-partition column views, so "
+            f"all `rows` partitions move at once. Load with "
+            f"nisa.dma_copy(dst=input_tile, src=x[start:start + rows, :]), then store with "
+            f"nisa.dma_copy(dst=out[start:start + rows, :], src=output_tile) and return `out`. "
+            f"Never write into x.\n"
+            f"{ledger}"
+            f"Fix the reported failure and any allocation it depends on, keeping the entry point "
+            f"`{nkibench.LEVELS[2]['entry']}(x, shape2D)` and both parameters. "
+            f"Reply with ONE complete python code block including imports.")
     if level == 3:
         return (
             f"Repair this single-tile NKI matmul:\n\n```python\n{source}\n```\n\n"
@@ -680,6 +1291,24 @@ def repair_prompt(level, source, feedback, a=None, ledger=""):
             f"Preserve the entry point, arguments and required output dtype. "
             f"Reply with ONE complete python code block.")
     if level == 1:
+        if "ap() pattern has invalid partition stride" in feedback.lower():
+            return (
+                f"Repair this NKI average-pooling kernel; preserve its entry point and arguments.\n\n"
+                f"```python\n{source}\n```\n\n"
+                f"The checker reports:\n{feedback}\n\n"
+                "Change the access pattern on the EXISTING full-input SBUF tile only. "
+                "Replace its current `.ap(...)` pattern with exactly:\n"
+                "```python\n"
+                "view = in_tile.ap([[H*W, C], [pool_size*W, H//pool_size], "
+                "[pool_size, W//pool_size], [W, pool_size], [1, pool_size]])\n"
+                "```\n"
+                "Use the names that your kernel already uses for C, H, W, and the full-input "
+                "tile. For the reported case C=32,H=32,W=32,pool_size=2, the concrete pairs "
+                "are [[1024,32],[64,16],[2,16],[32,2],[1,2]]. Every pair is "
+                "[element_stride,count]. The leading stride is H*W, never 0 or 1. Call `.ap()` "
+                "once on the original (C,H,W) tile. Do not rewrite other parts of the kernel. "
+                "Reply with one complete Python code block."
+            )
         # A local API repair cannot rescue an algorithm that multiplies a window
         # by itself. Let the model replace that computation while preserving the
         # entry point and the original operation's shape contract.
@@ -692,12 +1321,36 @@ def repair_prompt(level, source, feedback, a=None, ledger=""):
             f"Fix the reported error and any computation that does not average a window. "
             f"You may replace the algorithm; preserve the entry point and arguments. "
             f"Reply with ONE complete python code block.")
-    return (
-        f"This NKI kernel for {nkibench.LEVELS[level]['op']} is not right yet.\n\n"
-        f"```python\n{source}\n```\n\n"
-        f"A checker reports:\n{feedback}\n\n"
-        f"Change exactly what the checker names and keep everything else identical. Reply with "
-        f"ONE python code block.")
+    if level == 4:
+        return _assemble(a or _Dummy(), dict(
+            task=f"Repair this tiled NKI matmul kernel `{nkibench.LEVELS[level]['entry']}`.",
+            previous=f"```python\n{source}\n```",
+            feedback=f"A checker reports:\n{feedback}",
+            method=TILED_MATMUL_METHOD,
+            api_card=TILED_MATMUL_API_CARD,
+            imports=("Return a COMPLETE replacement file, not a function fragment. Include these "
+                     "exact imports before the decorator:\nimport nki\nimport nki.language as nl\n"
+                     "import nki.isa as nisa"),
+            scaffold=TILED_MATMUL_SKELETON if scaffold else "",
+            ledger=ledger,
+            reply=("Fix the reported failure while preserving the entry point, arguments, and "
+                   "output dtype. Reply with one complete Python code block containing imports "
+                   "and the function.")))
+    # Levels 5-7 repair through this generic shape with their card attached as the contract,
+    # which is how they were wired when each measured solved 3/3. The "change exactly what the
+    # checker names" instruction matters here: it discourages the wholesale rewrite that a
+    # bespoke repair prompt invited.
+    contract = {5: HOIST_SHAPES + "\n\n" + HOIST_API_CARD,
+                6: BLOCK_SHAPES + "\n\n" + BLOCK_API_CARD,
+                7: FULL_SHAPES + "\n\n" + FULL_API_CARD}.get(level, "")
+    return _assemble(a or _Dummy(), dict(
+        task=f"This NKI kernel for {nkibench.LEVELS[level]['op']} is not right yet.",
+        prev_code=f"```python\n{source}\n```",
+        feedback=f"A checker reports:\n{feedback}",
+        contract=contract,
+        ledger=ledger,
+        reply=("Change exactly what the checker names and keep everything else identical. Reply "
+               "with ONE python code block.")))
 
 
 CODE_BLOCK = re.compile(r"```(?:python)?\s*(.*?)```", re.S)
@@ -720,6 +1373,46 @@ def extract_code(text):
         if re.match(r"^\s*(import |from |@nki|def )", line):
             return "\n".join(lines[i:]).strip()
     return ""
+
+
+def ensure_level4_imports(source):
+    """Insert missing NKI module imports in a Level 4 model response."""
+    if not source.strip():
+        return source, []
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return source, []
+
+    imports = set()
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            imports.update((alias.name, alias.asname or alias.name.split(".")[0])
+                           for alias in node.names)
+
+    required = [
+        (("nki", "nki"), "import nki"),
+        (("nki.language", "nl"), "import nki.language as nl"),
+        (("nki.isa", "nisa"), "import nki.isa as nisa"),
+    ]
+    missing = [line for alias, line in required if alias not in imports]
+    if not missing:
+        return source, []
+
+    insertion_line = 1 if source.startswith("#!") else 0
+    for index, node in enumerate(tree.body):
+        is_docstring = (index == 0 and isinstance(node, ast.Expr)
+                        and isinstance(node.value, ast.Constant)
+                        and isinstance(node.value.value, str))
+        is_future = isinstance(node, ast.ImportFrom) and node.module == "__future__"
+        if is_docstring or is_future:
+            insertion_line = max(insertion_line, node.end_lineno)
+        else:
+            break
+
+    lines = source.splitlines(keepends=True)
+    lines[insertion_line:insertion_line] = [line + "\n" for line in missing]
+    return "".join(lines), missing
 
 
 # ---------------------------------------------------------------- the model
@@ -813,6 +1506,7 @@ def solve(a, level, log, rep=0):
     tried, streak, seen = [], 0, {}
     latest = ("", "")
     beam = []            # top-K distinct (reward, src, feedback) kept across rounds for --beam
+    scaffolded = False
     for rnd in range(a.rounds):
         t0 = time.perf_counter()
         a._last_truncated = False   # ask() sets this True if any sample hit finish_reason=length
@@ -828,6 +1522,9 @@ def solve(a, level, log, rep=0):
         graded = []
         for s_i, reply in enumerate(replies):
             src = extract_code(reply)
+            autofixes = []
+            if level == 4:
+                src, autofixes = ensure_level4_imports(src)
             reward, parts, feedback = grade(src, level)
             graded.append((reward, src, feedback, parts))
             # exp/run/sample/t let a --repeat log be split back into runs, which is what makes a
@@ -837,6 +1534,7 @@ def solve(a, level, log, rep=0):
                                       reward=reward, parts=parts, t=round(time.time(), 1),
                                       prompt_chars=len(prompt), reply_chars=len(reply),
                                       seg_chars=getattr(a, "_last_seg", {}),
+                                      scaffolded=scaffolded, autofixes=autofixes,
                                       code=src, feedback=feedback)) + "\n")
         log.flush()
         graded.sort(key=lambda g: g[0], reverse=True)
